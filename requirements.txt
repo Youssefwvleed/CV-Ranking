@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pymupdf
+pillow
+numpy
+paddleocr
+python-dotenv
+groq
+ollama
+requests
