@@ -1,7 +1,9 @@
 import json
+import os
 
 from ollama_parser import client, OLLAMA_MODEL
 
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 
 def verify_and_explain_ranking(
     job: dict,
@@ -163,9 +165,10 @@ There must be exactly one candidate object for every input candidate.
                 "content": prompt
             }
         ],
-        format="json",
+              format="json",
         options={
-            "temperature": 0
+            "temperature": 0,
+            "num_ctx": OLLAMA_NUM_CTX
         }
     )
 

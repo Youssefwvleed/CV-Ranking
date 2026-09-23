@@ -3,10 +3,11 @@ import json
 from .llm_client import chat_completion
 
 
-def compact_experience(experience):
+def compact_experience(experience, max_items=5):
     """
     Keep only the important experience information for the LLM.
     Avoid sending full achievements and large nested structures.
+    Cap to the most recent jobs to control prompt size.
     """
 
     if not experience:
@@ -14,7 +15,7 @@ def compact_experience(experience):
 
     compact = []
 
-    for item in experience:
+    for item in experience[:max_items]:
         if not isinstance(item, dict):
             continue
 
@@ -26,6 +27,29 @@ def compact_experience(experience):
         })
 
     return compact
+
+
+def truncate_text(text, max_chars=280):
+    """Cut long free-text fields (like resume summaries) to a safe length."""
+
+    if not text:
+        return ""
+
+    text = str(text).strip()
+
+    if len(text) <= max_chars:
+        return text
+
+    return text[:max_chars].rsplit(" ", 1)[0] + "..."
+
+
+def cap_list(items, max_items=15):
+    """Limit list length so one candidate can't blow up the prompt size."""
+
+    if not items:
+        return []
+
+    return items[:max_items]
 
 
 def compact_candidate(result):
@@ -45,39 +69,26 @@ def compact_candidate(result):
             4
         ),
 
-        "job_titles": candidate.get("job_titles", []),
+        "job_titles": cap_list(candidate.get("job_titles", []), 5),
 
         "experience_years": candidate.get(
             "experience_years"
         ),
 
-        "skills": candidate.get("skills", []),
+        "skills": cap_list(candidate.get("skills", []), 20),
 
-        "summary": candidate.get(
-            "summary",
-            ""
-        ),
+        "summary": truncate_text(candidate.get("summary", "")),
 
         "experience": compact_experience(
             candidate.get("experience", [])
         ),
 
-        "education": candidate.get(
-            "education",
-            []
-        ),
+        "education": cap_list(candidate.get("education", []), 5),
 
-        "certifications": candidate.get(
-            "certifications",
-            []
-        ),
+        "certifications": cap_list(candidate.get("certifications", []), 8),
 
-        "languages": candidate.get(
-            "languages",
-            []
-        ),
+        "languages": cap_list(candidate.get("languages", []), 5),
     }
-
 
 def verify_and_explain_ranking(
     job: dict,
@@ -103,7 +114,7 @@ def verify_and_explain_ranking(
     candidates_json = json.dumps(
         candidates,
         ensure_ascii=False,
-        indent=2
+        separators=(",", ":")
     )
 
     prompt = f"""

@@ -25,6 +25,21 @@ MODEL_NAME = os.getenv(
     "GROQ_MODEL",
     "openai/gpt-oss-20b"
 )
+def build_reasoning_kwargs():
+    """
+    reasoning_effort / include_reasoning only apply to GPT-OSS
+    (reasoning) models. Keep them scoped here so switching
+    GROQ_MODEL to a non-reasoning model (like llama-3.3-70b)
+    doesn't send parameters it doesn't understand.
+    """
+
+    if "gpt-oss" in MODEL_NAME:
+        return {
+            "reasoning_effort": "low",
+            "include_reasoning": False
+        }
+
+    return {}
 
 
 # ==========================================
@@ -40,6 +55,11 @@ OLLAMA_MODEL = os.getenv(
     "OLLAMA_MODEL",
     "llama3.1"
 )
+
+# Context window size sent to Ollama. Must be set explicitly —
+# otherwise Ollama silently truncates large prompts using its
+# default (small) context, which causes empty/inconsistent output.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 
 ollama_client = ollama.Client(
     host=OLLAMA_HOST
@@ -75,7 +95,8 @@ def chat_completion(
             temperature=temperature,
             response_format={
                 "type": "json_object"
-            }
+            },
+            **build_reasoning_kwargs()
         )
 
         return response.choices[0].message.content, "groq"
@@ -90,14 +111,13 @@ def chat_completion(
     # 2. OLLAMA
     # --------------------------------------
 
-    try:
-
         response = ollama_client.chat(
             model=OLLAMA_MODEL,
             messages=messages,
             format="json",
             options={
-                "temperature": temperature
+                "temperature": temperature,
+                "num_ctx": OLLAMA_NUM_CTX
             }
         )
 

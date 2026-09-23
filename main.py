@@ -5,7 +5,7 @@ os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
 os.environ["PADDLE_DISABLE_MKLDNN"] = "1"
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 import fitz
 import io
 import numpy as np
@@ -20,11 +20,17 @@ from paddleocr import PaddleOCR
 from resume_parser import parse_resume
 from parser_engine import parse_resume_with_fallback, parse_resumes_with_fallback_batch
 from ollama_parser import parse_resume_with_ollama
+from pydantic import BaseModel
+
+from ranking.pipeline import run_retrieval_pipeline
+from ranking.llm_explainer import verify_and_explain_ranking
+from candidate_adapter import adapt_candidate
 
 # Initialize PaddleOCR once
 ocr = PaddleOCR(
     lang="en",
     enable_mkldnn=False,
+    cpu_threads=8,
     use_doc_orientation_classify=False,
     use_doc_unwarping=False,
     use_textline_orientation=False,
@@ -32,6 +38,16 @@ ocr = PaddleOCR(
  
 app = FastAPI(title="CV OCR API")
 
+class JobRequest(BaseModel):                                      
+    title: str
+    description: str = ""
+    skills: list[str] = []
+    related_titles: list[str] = []
+    experience_years: int = 0
+    experience_level: str = ""
+    employment_type: str = ""
+    top_k: int = 10
+    
 cv_queue = asyncio.Queue()
 
 queue_results = {}
@@ -88,7 +104,13 @@ async def cv_worker():
 
                 print(f"OCR: {filename}")
 
-                extracted_text = extract_text_from_pdf(file_bytes)
+                # await asyncio.to_thread keeps the API responsive
+                # to other requests while OCR runs, WITHOUT running
+                # multiple OCR calls on the same model at once.
+                extracted_text = await asyncio.to_thread(
+                    extract_text_from_pdf,
+                    file_bytes
+                )
 
                 processed_batch.append({
                     "job_id": job_id,
@@ -120,13 +142,18 @@ async def cv_worker():
                     processed_batch
                 )
 
-                for cv, candidate in zip(
+                for cv, parsed_resume in zip(
                     processed_batch,
                     batch_results
                 ):
 
                     job_id = cv["job_id"]
                     filename = cv["filename"]
+
+                    candidate = adapt_candidate(
+                        parsed_resume=parsed_resume,
+                        candidate_id=job_id
+                    )
 
                     queue_results[job_id] = {
                         "job_id": job_id,
@@ -155,8 +182,13 @@ async def cv_worker():
 
                     try:
 
-                        candidate = parse_resume(
+                        parsed_resume = parse_resume(
                             cv["text"]
+                        )
+
+                        candidate = adapt_candidate(
+                            parsed_resume=parsed_resume,
+                            candidate_id=job_id
                         )
 
                         queue_results[job_id] = {
@@ -211,6 +243,25 @@ def run_paddle_ocr(image: Image.Image) -> str:
 
     return "\n".join(texts)
 
+def render_page_capped(page, max_side=2000):
+    """
+    Render a PDF page so its longest side is close to max_side,
+    regardless of the page's own physical dimensions. This avoids
+    rendering a huge pixmap (for oddly-sized pages) just to have
+    PaddleOCR shrink it again internally afterwards.
+    """
+
+    width_pts = page.rect.width
+    height_pts = page.rect.height
+
+    longest_pts = max(width_pts, height_pts, 1)
+
+    scale = max_side / longest_pts
+
+    matrix = fitz.Matrix(scale, scale)
+
+    return page.get_pixmap(matrix=matrix)
+
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """
     Extract text from PDF.
@@ -223,7 +274,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         stream=pdf_bytes,
         filetype="pdf"
     )
-
+    
     extracted_text = []
 
     for page in document:
@@ -238,7 +289,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         else:
 
             # No selectable text → OCR
-            pix = page.get_pixmap(dpi=200)
+            pix = render_page_capped(page)
 
             image_bytes = pix.tobytes("png")
 
@@ -270,7 +321,7 @@ def extract_ocr_from_pdf(pdf_bytes: bytes) -> str:
 
     for page in document:
 
-        pix = page.get_pixmap(dpi=200)
+        pix = render_page_capped(page)
 
         image_bytes = pix.tobytes("png")
 
@@ -466,3 +517,124 @@ async def queue_results_all():
         "total": len(queue_results),
         "results": list(queue_results.values())
     }
+@app.post("/rank-candidates")
+async def rank_candidates(job: JobRequest):
+
+    candidates = [
+        r["candidate"]
+        for r in queue_results.values()
+        if r.get("status") == "completed"
+    ]
+
+    if not candidates:
+        return {
+            "error": (
+                "No completed candidates available. "
+                "Upload CVs via /queue-cv or /queue-cvs first, "
+                "and check /queue-results until status is 'completed'."
+            )
+        }
+
+    job_dict = job.model_dump()
+
+    ranked = run_retrieval_pipeline(
+        job_dict,
+        candidates,
+        top_k=job_dict["top_k"]
+    )
+
+    if not ranked:
+        return {
+            "error": "No candidates passed the hard filter for this job."
+        }
+
+    llm_result = verify_and_explain_ranking(
+        job_dict,
+        ranked
+    )
+
+    return {
+        "job_title": job_dict["title"],
+        "total_candidates_available": len(candidates),
+        "qualified_and_ranked": len(ranked),
+        "hybrid_ranking": [
+            {
+                "candidate_id": r["candidate_id"],
+                "hybrid_score": round(r["hybrid_score"], 4)
+            }
+            for r in ranked
+        ],
+        "llm_verification": llm_result
+    }    
+    
+@app.post("/full-test")
+async def full_test(
+    files: list[UploadFile] = File(...),
+    job: str = Form(...)
+):
+    """
+    One-shot end-to-end test: upload CVs + job details together,
+    get back the final ranked + LLM-explained result immediately.
+    No queue, no waiting — good for quick tests with a handful of CVs.
+    """
+
+    try:
+        job_dict = json.loads(job)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON in 'job' field."}
+
+    candidates = []
+
+    for file in files:
+
+        file_bytes = await file.read()
+
+        try:
+            extracted_text = extract_text_from_pdf(file_bytes)
+
+            parsed_resume, engine_used = parse_resume_with_fallback(
+                extracted_text
+            )
+
+            candidate_id = file.filename.rsplit(".", 1)[0]
+
+            candidate = adapt_candidate(
+                parsed_resume=parsed_resume,
+                candidate_id=candidate_id
+            )
+
+            candidates.append(candidate)
+
+        except Exception as e:
+            print(f"Failed to process {file.filename}: {e}")
+
+    if not candidates:
+        return {"error": "No CVs could be processed successfully."}
+
+    ranked = run_retrieval_pipeline(
+        job_dict,
+        candidates,
+        top_k=job_dict.get("top_k", 10)
+    )
+
+    if not ranked:
+        return {"error": "No candidates passed the hard filter for this job."}
+
+    llm_result = verify_and_explain_ranking(
+        job_dict,
+        ranked
+    )
+
+    return {
+        "job_title": job_dict.get("title"),
+        "total_candidates_processed": len(candidates),
+        "qualified_and_ranked": len(ranked),
+        "hybrid_ranking": [
+            {
+                "candidate_id": r["candidate_id"],
+                "hybrid_score": round(r["hybrid_score"], 4)
+            }
+            for r in ranked
+        ],
+        "llm_verification": llm_result
+    }    
