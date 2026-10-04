@@ -1,6 +1,6 @@
 import json
 
-from .llm_client import chat_completion
+from ranking.llm_client import chat_completion
 
 
 def compact_experience(experience, max_items=5):
@@ -71,9 +71,7 @@ def compact_candidate(result):
 
         "job_titles": cap_list(candidate.get("job_titles", []), 5),
 
-        "experience_years": candidate.get(
-            "experience_years"
-        ),
+        "experience_years": candidate.get("experience_years"),
 
         "skills": cap_list(candidate.get("skills", []), 20),
 
@@ -90,34 +88,16 @@ def compact_candidate(result):
         "languages": cap_list(candidate.get("languages", []), 5),
     }
 
-def verify_and_explain_ranking(
-    job: dict,
-    ranked_candidates: list[dict]
-) -> dict:
 
-    candidates = []
+def verify_and_explain_ranking(job, ranked_candidates):
+    """
+    Verifies the hybrid ranking and generates HR-style explanations
+    for each candidate. Candidates are sent to the LLM in small
+    batches (not all at once) to keep each request small and
+    reliable regardless of how many candidates reach this step.
+    """
 
-    for position, result in enumerate(
-        ranked_candidates,
-        start=1
-    ):
-        result_copy = dict(result)
-
-        # Store rank explicitly because some ranking
-        # results do not contain it.
-        result_copy["rank"] = position
-
-        candidates.append(
-            compact_candidate(result_copy)
-        )
-
-    candidates_json = json.dumps(
-        candidates,
-        ensure_ascii=False,
-        separators=(",", ":")
-    )
-
-    prompt = f"""
+    prompt_template = """
 You are a recruitment ranking verification assistant.
 
 The candidates below have already been ranked by a Hybrid
@@ -183,19 +163,19 @@ IMPORTANT RULES:
 JOB:
 
 Title:
-{job.get("title", "")}
+""" + str(job.get("title", "")) + """
 
 Description:
-{job.get("description", "")}
+""" + str(job.get("description", "")) + """
 
 Required Skills:
-{job.get("skill_ids", job.get("skills", []))}
+""" + str(job.get("skill_ids", job.get("skills", []))) + """
 
 Experience Level:
-{job.get("experience_level", "")}
+""" + str(job.get("experience_level", "")) + """
 
 Employment Type:
-{job.get("employment_type", "")}
+""" + str(job.get("employment_type", "")) + """
 
 CANDIDATES:
 
@@ -203,57 +183,113 @@ CANDIDATES:
 
 Return ONLY valid JSON.
 
-Use exactly this structure:
+Use exactly this JSON structure (field names and types below).
+The content inside the example ("3 years of experience...", etc.)
+is ILLUSTRATIVE ONLY, to show you the expected level of detail —
+you MUST replace it with real analysis based on the actual
+candidate data provided above. Do not copy the example text.
+Do not leave fields empty unless the candidate data genuinely
+gives you nothing to say about that specific point.
 
-{{
+{
     "ranking_valid": true,
     "corrected_order": [],
     "candidates": [
-        {{
+        {
             "candidate_id": "CV_001",
-            "pros": [],
-            "cons": [],
-            "matching_skills": [],
-            "missing_skills": [],
-            "experience_summary": "",
-            "recommendation": ""
-        }}
-    ]
-}}
-
-There must be exactly one candidate object
-for every input candidate.
-"""
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You verify recruitment rankings and provide "
-                "evidence-based candidate explanations. "
-                "Return only valid JSON."
-            )
-        },
-        {
-            "role": "user",
-            "content": prompt
+            "pros": [
+                "3 years of relevant backend development experience",
+                "Has a certification that matches a job requirement"
+            ],
+            "cons": [
+                "No direct experience with the specific industry in the job description"
+            ],
+            "matching_skills": ["Python", "SQL"],
+            "missing_skills": ["Kubernetes"],
+            "experience_summary": "4 years as a backend developer across two companies, most recently leading API development.",
+            "recommendation": "Strong match for the role based on technical skill overlap."
         }
     ]
+}
 
-    print(
-        f"LLM prompt size: "
-        f"{len(prompt):,} characters"
-    )
+There must be exactly one candidate object
+for every input candidate, each with real,
+specific analysis based on that candidate's
+actual data — not placeholder text.
+"""
 
-    content, provider = chat_completion(
-        messages,
-        temperature=0
-    )
+    def call_llm_for_batch(candidate_batch):
 
-    print(
-        f"LLM provider used: {provider}"
-    )
+        candidates = [
+            compact_candidate(r)
+            for r in candidate_batch
+        ]
 
-    data = json.loads(content)
+        candidates_json = json.dumps(
+            candidates,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
 
-    return data
+        batch_prompt = prompt_template.replace(
+            "{candidates_json}",
+            candidates_json
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You verify recruitment rankings and provide "
+                    "evidence-based candidate explanations. "
+                    "Return only valid JSON."
+                )
+            },
+            {
+                "role": "user",
+                "content": batch_prompt
+            }
+        ]
+
+        print(
+            f"LLM prompt size: "
+            f"{len(batch_prompt):,} characters"
+        )
+
+        content, provider = chat_completion(
+            messages,
+            temperature=0
+        )
+
+        print(
+            f"LLM provider used: {provider}"
+        )
+
+        return json.loads(content)
+
+    BATCH_SIZE = 5
+
+    batches = [
+        ranked_candidates[i:i + BATCH_SIZE]
+        for i in range(0, len(ranked_candidates), BATCH_SIZE)
+    ]
+
+    all_candidates_explained = []
+    overall_valid = True
+
+    for batch in batches:
+
+        result = call_llm_for_batch(batch)
+
+        all_candidates_explained.extend(
+            result.get("candidates", [])
+        )
+
+        if not result.get("ranking_valid", True):
+            overall_valid = False
+
+    return {
+        "ranking_valid": overall_valid,
+        "corrected_order": [],
+        "candidates": all_candidates_explained
+    }
